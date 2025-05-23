@@ -1,4 +1,5 @@
 import os
+import json
 import fitz  # PyMuPDF
 import textract
 import pandas as pd
@@ -9,15 +10,88 @@ import numpy as np
 import io
 import threading
 import pytesseract
+from pdf2image import convert_from_path
+import tempfile
+import shutil
+import subprocess
 from scipy.stats import entropy
 from PIL import Image
-from docx import Document
+from docx.table import _Cell, Table
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from typing import Dict, Union, List
 from PIL import Image
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import md5
+from docx import Document
+from docx.text.paragraph import Paragraph as DocumentParagraph
+
+
+def iter_block_items(parent):
+    """
+    Yield paragraphs and tables in document order from a parent element.
+    """
+    for child in parent.element.body.iterchildren():
+        if child.tag.endswith('}p'):
+            yield DocumentParagraph(parent._parent, child)
+        elif child.tag.endswith('}tbl'):
+            yield Table(child, parent)
+
+def extract_visual_figures_from_docx(filepath, dpi=300, min_length=100, existing_hashes=None, save_dir="extracted_images/ocr_docx"):
+    os.makedirs(save_dir, exist_ok=True)
+    figures = []
+    seen_hashes = existing_hashes or set()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Convert to PDF first
+        pdf_path = os.path.join(tmpdir, "temp.pdf")
+        subprocess.run(["docx2pdf", filepath, pdf_path], check=True)
+        
+        # Convert PDF pages to images
+        pages = convert_from_path(pdf_path, dpi=dpi)
+        for page_num, img in enumerate(pages):
+            buffer = io.BytesIO()
+            img.save(buffer, format="PNG")
+            img_bytes = buffer.getvalue()
+            image_hash = get_image_hash(img_bytes)
+
+            if image_hash in seen_hashes:
+                continue
+            seen_hashes.add(image_hash)
+
+            img_path = os.path.join(save_dir, f"ocr_page{page_num+1}.png")
+            img.save(img_path)
+
+            ocr_text = ocr_image_with_tesseract(img)
+            if ocr_text and len(ocr_text) >= min_length:
+                figures.append({
+                    "image": img_path,
+                    "text": f"**Figure (Page {page_num+1})**:\n```\n{ocr_text}\n```"
+                })
+    return figures, seen_hashes
+
+def extract_unique_images_from_docx(filepath, output_dir="extracted_images/docx"):
+    os.makedirs(output_dir, exist_ok=True)
+    doc = Document(filepath)
+    images = []
+    seen_hashes = set()
+
+    for i, rel in enumerate(doc.part._rels):
+        rel = doc.part._rels[rel]
+        if "image" in rel.target_ref:
+            image_data = rel.target_part.blob
+            image_hash = get_image_hash(image_data)
+            if image_hash in seen_hashes or is_image_blank_or_small(image_data):
+                continue
+            seen_hashes.add(image_hash)
+            image_ext = rel.target_ref.split('.')[-1]
+            image_path = os.path.join(output_dir, f"image{i+1}.{image_ext}")
+            with open(image_path, 'wb') as f:
+                f.write(image_data)
+            images.append(image_path)
+    return images, seen_hashes
+
 
 def ocr_image_with_tesseract(img: Image.Image) -> str:
     try:
@@ -27,20 +101,41 @@ def ocr_image_with_tesseract(img: Image.Image) -> str:
         print(f"OCR error: {e}")
         return ""
 
-def extract_visual_figures_from_pdf(filepath, dpi=300, min_length=100):
+def extract_visual_figures_from_pdf(filepath, dpi=300, min_length=100, existing_hashes=None, save_dir="extracted_images/ocr"):
+    os.makedirs(save_dir, exist_ok=True)
     figures = []
-    try:
-        doc = fitz.open(filepath)
-        for page_num, page in enumerate(doc):
-            pix = page.get_pixmap(dpi=dpi)
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-            ocr_text = ocr_image_with_tesseract(img)
-            # Heuristic: consider long OCR results that are NOT captured by pdfplumber
-            if ocr_text and len(ocr_text) >= min_length:
-                figures.append(f"**Figure (Page {page_num+1})**:\n```\n{ocr_text}\n```")
-    except Exception as e:
-        print(f"OCR visual figure extraction failed: {e}")
-    return figures
+    seen_hashes = existing_hashes or set()
+    doc = fitz.open(filepath)
+
+    for page_num, page in enumerate(doc):
+        # Extract text normally
+        page_text = page.get_text().strip()
+
+        # If page text is sufficient, skip OCR
+        if page_text and len(page_text) >= min_length:
+            continue  # Skip OCR image generation on this page
+
+        # Otherwise, do OCR on page image
+        pix = page.get_pixmap(dpi=dpi)
+        img_bytes = pix.tobytes("png")
+        img = Image.open(io.BytesIO(img_bytes))
+        image_hash = get_image_hash(img_bytes)
+
+        if image_hash in seen_hashes:
+            continue
+        seen_hashes.add(image_hash)
+
+        img_path = os.path.join(save_dir, f"ocr_page{page_num+1}.png")
+        img.save(img_path)
+
+        ocr_text = ocr_image_with_tesseract(img)
+        if ocr_text and len(ocr_text) >= min_length:
+            figures.append({
+                "image": img_path,
+                "text": f"**Figure (Page {page_num+1})**:\n```\n{ocr_text}\n```"
+            })
+
+    return figures, seen_hashes
 
 def clean_text(text):
     return text.encode('utf-16', 'surrogatepass').decode('utf-16')
@@ -86,50 +181,45 @@ def is_image_too_small(image_path, min_size=20):
 def get_image_hash(image_bytes):
     return md5(image_bytes).hexdigest()
 
-def extract_unique_images_from_pdf(filepath, output_dir="extracted_images/pdf", max_workers=8):
+def extract_unique_images_from_pdf(filepath, output_dir="extracted_images/pdf"):
     os.makedirs(output_dir, exist_ok=True)
-    images = []
-    seen_xrefs = set()
     doc = fitz.open(filepath)
-    lock = threading.Lock()
+    images_by_page = []
+    seen_hashes = set()
 
-    def process_xref(xref, page_num, img_index):
-        try:
-            with lock:
-                if xref in seen_xrefs:
-                    return None
-                seen_xrefs.add(xref)
+    for page_num, page in enumerate(doc):
+        page_images = []
+        image_list = page.get_images(full=True)
 
-            base_image = doc.extract_image(xref)
-            image_bytes = base_image["image"]
-            if is_image_blank_or_small(image_bytes):
-                return None
-
-            image_ext = base_image["ext"]
-            image_filename = f"page{page_num+1}_img{img_index+1}.{image_ext}"
-            image_path = os.path.join(output_dir, image_filename)
-            with open(image_path, "wb") as f:
-                f.write(image_bytes)
-            return image_path
-        except Exception as e:
-            print(f"Image processing error: {e}")
-            return None
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = []
-        for page_num, page in enumerate(doc):
-            image_list = page.get_images(full=True)
-            for img_index, img in enumerate(image_list):
+        for img_index, img in enumerate(image_list):
+            try:
                 xref = img[0]
-                futures.append(executor.submit(process_xref, xref, page_num, img_index))
+                base_image = doc.extract_image(xref)
+                image_bytes = base_image["image"]
+                image_hash = get_image_hash(image_bytes)
 
-        for future in futures:
-            result = future.result()
-            if result:
-                images.append(result)
+                if image_hash in seen_hashes or is_image_blank_or_small(image_bytes):
+                    continue
+                seen_hashes.add(image_hash)
 
-    return images
+                image_ext = base_image["ext"]
+                image_filename = f"page{page_num+1}_img{img_index+1}.{image_ext}"
+                image_path = os.path.join(output_dir, image_filename).replace("\\", "/")
 
+                with open(image_path, "wb") as f:
+                    f.write(image_bytes)
+
+                page_images.append({
+                    "path": image_path,
+                    "page": page_num + 1
+                })
+
+            except Exception as e:
+                print(f"Image extraction error on page {page_num+1}: {e}")
+
+        images_by_page.extend(page_images)
+
+    return images_by_page, seen_hashes
 
 def process_image_from_pdf(doc, page_num, img_index, img, hashes, output_dir):
     try:
@@ -137,18 +227,24 @@ def process_image_from_pdf(doc, page_num, img_index, img, hashes, output_dir):
         base_image = doc.extract_image(xref)
         image_bytes = base_image["image"]
         image_hash = get_image_hash(image_bytes)
+        
         with hashes_lock:
             if image_hash in hashes:
                 return None
             hashes.add(image_hash)
+        
         if is_image_blank_or_small(image_bytes):
             return None
+
         image_ext = base_image["ext"]
         image_filename = f"page{page_num+1}_img{img_index+1}.{image_ext}"
         image_path = os.path.join(output_dir, image_filename)
+        
         with open(image_path, "wb") as f:
             f.write(image_bytes)
-        return image_path
+
+        return {"path": image_path, "page": page_num + 1}
+    
     except Exception as e:
         print(f"Error processing image on page {page_num+1} img {img_index+1}: {e}")
         return None
@@ -194,63 +290,96 @@ def extract_comments_from_docx(filepath):
                     comments.append(text)
     return comments
 
-def parse_docx(filepath):
+def parse_docx_ordered(filepath):
+    content = []
+    images, image_hashes = extract_unique_images_from_docx(filepath)
+    visual_figures, _ = extract_visual_figures_from_docx(filepath, existing_hashes=image_hashes)
+
     doc = Document(filepath)
-    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-    headings = [p.text for p in doc.paragraphs if p.style.name.startswith('Heading')]
-    tables = []
-    for table in doc.tables:
-        data = []
-        for row in table.rows:
-            data.append([cell.text for cell in row.cells])
-        tables.append(data)
+    # We will collect images separately with a mapping to placeholders if possible
+    # Since inline image extraction is tricky, for now just list extracted images separately.
 
-    comments = extract_comments_from_docx(filepath)
-    images = extract_images_from_docx(filepath)
+    for block in iter_block_items(doc):
+        if isinstance(block, DocumentParagraph):
+            text = block.text.strip()
+            if text:
+                content.append({"type": "text", "content": text})
+        elif isinstance(block, Table):
+            # Extract table content as list of rows
+            table_data = []
+            for row in block.rows:
+                table_data.append([cell.text.strip() for cell in row.cells])
+            content.append({"type": "table", "content": table_data})
 
-    return {
-        'text': "\n\n".join(paragraphs),
-        'headings': headings,
-        'tables': tables,
-        'images': images,
-        'annotations': comments
-    }
+    # Add extracted images as separate entries
+    for img_path in images:
+        content.append({"type": "image", "content": img_path})
+
+    # Add visual figures (OCR) as text blocks
+    for vf in visual_figures:
+        content.append({"type": "visual_figure", "content": vf["text"]})
+
+    # Extract comments
+    annotations = extract_comments_from_docx(filepath)
+    for note in annotations:
+        content.append({"type": "annotation", "content": note})
+
+    return content
 
 def extract_annotations_from_pdf(filepath):
     annotations = []
     doc = fitz.open(filepath)
     for page in doc:
-        for annot in page.annots():
-            info = annot.info
-            if 'content' in info:
-                annotations.append(info['content'])
+        annots = page.annots()
+        if annots:
+            for annot in annots:
+                info = annot.info
+                if 'content' in info:
+                    annotations.append(info['content'])
     return annotations
 
-def parse_pdf(filepath):
+def parse_pdf_ordered(filepath):
     content = []
-    tables = []
     annotations = extract_annotations_from_pdf(filepath)
-    images = extract_unique_images_from_pdf(filepath)
+    images, image_hashes = extract_unique_images_from_pdf(filepath)
+    visual_figures, _ = extract_visual_figures_from_pdf(filepath, existing_hashes=image_hashes)
 
     with pdfplumber.open(filepath) as pdf:
-        for page in pdf.pages:
+        for page_num, page in enumerate(pdf.pages):
+            # Text
             text = page.extract_text()
             if text:
-                content.append(text)
+                content.append({"type": "text", "content": text.strip(), "page": page_num+1})
+
+            # Tables
             try:
-                tables.extend(page.extract_tables())
+                tables = page.extract_tables()
+                for table in tables:
+                    content.append({"type": "table", "content": table, "page": page_num+1})
             except:
                 pass
 
-    visual_figures = extract_visual_figures_from_pdf(filepath)
+            # Images on this page
+            # Images on this page
+            page_images = [img["path"] for img in images if img["page"] == page_num + 1]
+            for img_path in page_images:
+                content.append({"type": "image", "content": img_path, "page": page_num + 1})
 
-    return {
-        'text': '\n\n'.join(content),
-        'tables': tables,
-        'images': images,
-        'annotations': annotations,
-        'visual_figures': visual_figures
-    }
+            # Annotations on this page
+            # We can try to match annotations to pages, if available, else add at end
+            # For now add all at the end after all pages
+
+            # Visual figures OCR on this page
+            # Visual figures may have page info, filter those for this page
+            vf_for_page = [vf["text"] for vf in visual_figures if f"(Page {page_num+1})" in vf["text"]]
+            for vf_text in vf_for_page:
+                content.append({"type": "visual_figure", "content": vf_text, "page": page_num+1})
+
+    # Append annotations at the end (could be improved by linking to page)
+    for note in annotations:
+        content.append({"type": "annotation", "content": note})
+
+    return content
 
 
 def parse_with_textract(filepath):
@@ -297,81 +426,75 @@ def parse_xlsx(filepath: str) -> Dict[str, Union[str, List]]:
 
     return xlsx_data
 
-def parse_file(filepath: str) -> Dict[str, Union[str, List]]:
+def parse_file_ordered(filepath):
     ext = filepath.lower().split('.')[-1]
-
-    if ext == 'pdf':
-        return parse_pdf(filepath)
-    elif ext == 'docx':
-        return parse_docx(filepath)
-    elif ext == 'txt':
-        return parse_txt(filepath)
-    elif ext == 'csv':
-        return parse_csv(filepath)
+    if ext == "pdf":
+        return parse_pdf_ordered(filepath)
+    elif ext == "docx":
+        return parse_docx_ordered(filepath)
+    elif ext == "txt":
+        text_data = parse_txt(filepath)
+        return [{"type": "text", "content": text_data.get("text", "")}]
+    elif ext == "csv":
+        csv_data = parse_csv(filepath)
+        # treat CSV as tables
+        tables = csv_data.get("tables", [])
+        content = []
+        for table in tables:
+            content.append({"type": "table", "content": table})
+        return content
     elif ext == "xlsx":
-        return parse_xlsx(filepath)
+        xlsx_data = parse_xlsx(filepath)
+        content = []
+        for table in xlsx_data.get("tables", []):
+            content.append({"type": "table", "content": table})
+        text = xlsx_data.get("text", "")
+        if text:
+            content.append({"type": "text", "content": text})
+        return content
     elif ext in ['rtf', 'doc', 'wpd', 'wps']:
         converted = convert_with_libreoffice(filepath)
         if converted and os.path.exists(converted):
-            return parse_docx(converted)
+            return parse_docx_ordered(converted)
         else:
-            return parse_with_textract(filepath)
+            text_data = parse_with_textract(filepath)
+            return [{"type": "text", "content": text_data.get("text", "")}]
     else:
-        return {'error': f"Unsupported file type: {ext}"}
+        return [{"type": "text", "content": f"Unsupported file type: {ext}"}]
 
-def format_markdown(result: Dict[str, Union[str, List]]) -> str:
-    md = []
-    headings = result.get("headings", [])
-    if headings:
-        md.append("## \ud83d\udccc Headings")
-        for idx, h in enumerate(headings, 1):
-            md.append(f"{idx}. {h}")
 
-    text = result.get("text", "")
-    if text:
-        md.append("\n## \ud83d\udcc4 Text\n")
-        md.append(text.strip())
+def format_jsonl_ordered(content_list):
+    jsonl_entries = []
+    for item in content_list:
+        entry = {
+            "type": item.get("type"),
+            "content": item.get("content")
+        }
+        # Optional metadata
+        if "line_number" in item:
+            entry["line_number"] = item["line_number"]
+        if "page" in item:
+            entry["page"] = item["page"]
+        if "y0" in item:
+            entry["y0"] = item["y0"]
+        jsonl_entries.append(entry)
+    return jsonl_entries
 
-    tables = result.get("tables", [])
-    if tables:
-        md.append("\n## \ud83d\udcca Tables\n")
-        for i, table in enumerate(tables):
-            if isinstance(table, list) and all(isinstance(row, list) for row in table):
-                md.append(f"**Table {i+1}:**\n")
-                headers = [str(h) if h is not None else "" for h in table[0]]
-                md.append("| " + " | ".join(headers) + " |")
-                md.append("|" + " --- |" * len(headers))
-                for row in table[1:]:
-                    row_clean = [str(cell) if cell is not None else "" for cell in row]
-                    md.append("| " + " | ".join(row_clean) + " |")
-                md.append("")
-            elif isinstance(table, list) and all(isinstance(row, dict) for row in table):
-                headers = list(table[0].keys())
-                md.append(f"**Table {i+1}:**\n")
-                md.append("| " + " | ".join(headers) + " |")
-                md.append("|" + " --- |" * len(headers))
-                for row in table:
-                    md.append("| " + " | ".join(str(row[h]) for h in headers) + " |")
-                md.append("")
+def write_jsonl_from_formatted(content_list, output_path):
+    dir_path = os.path.dirname(output_path)
+    if dir_path:
+        os.makedirs(dir_path, exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        for item in content_list:
+            json.dump(item, f, ensure_ascii=False)
+            f.write('\n')
 
-    annotations = result.get("annotations", [])
-    if annotations:
-        md.append("\n## \ud83d\udcc2 Annotations\n")
-        for idx, note in enumerate(annotations, 1):
-            md.append(f"- {note}")
+def run_parser(filepath):
+    result = parse_file_ordered(filepath)
+    output_path = os.path.splitext(filepath)[0] + "_output.jsonl"
+    write_jsonl_from_formatted(result, output_path)
+    return output_path  # ✅ return path for programmatic use
 
-    images = result.get("images", [])
-    if images:
-        md.append("\n## 🖼️ Images\n")
-        for i, img_path in enumerate(images, 1):
-            md.append(f"![Image {i}]({img_path})")
-    
-    visual_figures = result.get("visual_figures", [])
-    if visual_figures:
-        md.append("\n## 🧾 OCR-based Visual Figures\n")
-        md.extend(visual_figures)
-
-    return "\n".join(md)
 
 if __name__ == "__main__":
     import sys
@@ -384,15 +507,11 @@ if __name__ == "__main__":
         print(f"File not found: {filepath}")
         sys.exit(1)
 
-    result = parse_file(filepath)
-    markdown_output = format_markdown(result)
+    result = run_parser(filepath)
 
-    output_path = os.path.splitext(filepath)[0] + "_output.md"
+    output_path = os.path.splitext(filepath)[0] + "_output.jsonl"
 
-    cleaned_markdown = clean_text(markdown_output)
+    # Write JSONL output
+    write_jsonl_from_formatted(result, output_path)
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(cleaned_markdown)
-
-
-    print(f"✅ Markdown output saved to: {output_path}")
+    print(f"✅ JSONL output saved to: {output_path}")
